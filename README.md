@@ -14,6 +14,24 @@ CDN cache, a pending build, or a deploy that silently went sideways.
 No more "I pushed it, why isn't it live?" guessing. One command, an exit code
 your CI can gate on, and a human-readable verdict.
 
+## How it works
+
+```mermaid
+flowchart LR
+    A["local git repo<br/>(HEAD sha + commit time)"] --> D["dsv"]
+    B["live URL<br/>(HTTP probe + HTML fingerprints)"] --> D
+    C["provider CLI<br/>vercel / wrangler / railway"] --> D
+    D --> E{"verdict"}
+    E -->|"commit matches HEAD"| F["deployed"]
+    E -->|"older than HEAD / building"| G["deploy_pending"]
+    E -->|"prod commit differs"| H["deploy_mismatch"]
+    E -->|"cache hit only"| I["stale_cache"]
+```
+
+Three inputs, one decision. `dsv` probes the live site, asks the provider
+what it actually deployed, compares both against your local HEAD, and lands
+on a single verdict — from strongest signal to weakest.
+
 ## Install
 
 ```bash
@@ -46,6 +64,12 @@ dsv check --url https://app.example.com --json
 dsv ls --repo ~/my-app
 ```
 
+Use it in CI to fail a job when prod silently drifted:
+
+```bash
+dsv check --url https://app.example.com --repo . --json || echo "deploy drifted!"
+```
+
 ## Exit codes
 
 | Code | Meaning |
@@ -54,15 +78,26 @@ dsv ls --repo ~/my-app
 | 1    | Stale signals — cache, deploy older than HEAD, or commit mismatch |
 | 2    | Setup error — bad URL, not a git repo, network failure, missing CLI |
 
-Use it in CI to fail a job when prod silently drifted:
-
-```bash
-dsv check --url https://app.example.com --repo . --json || echo "deploy drifted!"
-```
-
 ## How it decides
 
 Diagnostic ladder, strongest signal first:
+
+```mermaid
+flowchart TD
+    S["dsv check"] --> G["read local HEAD"]
+    G --> P["probe live URL"]
+    P --> FP["extract build fingerprints"]
+    G --> PC{"provider CLI available?"}
+    PC -- "no" --> F3{"fingerprints in HTML?"}
+    F3 -- "yes" --> DL["deployed<br/>low confidence"]
+    F3 -- "no" --> UN["unknown"]
+    PC -- "yes" --> C1{"prod commit matches HEAD?"}
+    C1 -- "yes" --> DH["deployed<br/>high confidence"]
+    C1 -- "no" --> MM["deploy_mismatch<br/>high confidence"]
+    C1 -- "no commit info" --> C2{"deploy newer than<br/>HEAD commit time?"}
+    C2 -- "yes" --> DM["deployed<br/>medium confidence"]
+    C2 -- "no" --> DP["deploy_pending<br/>medium confidence"]
+```
 
 1. **Provider-reported git commit vs local HEAD** — `vercel ls` exposes the
    deployed commit SHA. If it matches your HEAD: `deployed`, high confidence.
@@ -74,7 +109,21 @@ Diagnostic ladder, strongest signal first:
    `/_next/static/` hashes. Weakest signal, only used when the provider check
    is unavailable.
 
-Verdicts: `deployed` · `stale_cache` · `deploy_pending` · `deploy_mismatch` · `unknown`
+### Verdict states
+
+```mermaid
+stateDiagram-v2
+    [*] --> unknown
+    unknown --> deployed: fingerprints found in HTML
+    unknown --> stale_cache: CDN cache HIT only
+    deployed --> deploy_mismatch: prod commit != HEAD
+    deploy_mismatch --> deployed: redeploy from the right branch
+    deploy_pending --> deployed: build completes
+    stale_cache --> deployed: hard refresh / cache bust
+```
+
+Every verdict other than `deployed` / `unknown` ships with a concrete
+suggested fix, printed right under the verdict in the CLI output.
 
 ## Provider detection
 
